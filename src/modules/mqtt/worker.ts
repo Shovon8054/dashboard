@@ -47,6 +47,14 @@ export function startMqttWorker() {
   });
 
   function connect() {
+    if (mqttClient) {
+      try {
+        mqttClient.removeAllListeners();
+        mqttClient.end(true);
+      } catch {}
+      mqttClient = null;
+    }
+
     console.log(`Connecting to MQTT broker at ${brokerUrl} as ${clientId}...`);
 
     mqttClient = mqtt.connect(brokerUrl, {
@@ -59,7 +67,7 @@ export function startMqttWorker() {
         qos: 1,
         retain: false,
       },
-      reconnectPeriod: 0, // Handle manual backoff
+      reconnectPeriod: 0, // Manual exponential backoff
       connectTimeout: 10000,
     });
 
@@ -88,7 +96,7 @@ export function startMqttWorker() {
         }
       });
 
-      // 30s Heartbeat
+      // Heartbeat every 30s
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       heartbeatTimer = setInterval(() => {
         if (mqttClient?.connected) {

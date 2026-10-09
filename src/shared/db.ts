@@ -3,8 +3,14 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+const connectionString = process.env.DATABASE_URL;
+const isRemote =
+  connectionString?.includes('supabase.com') ||
+  connectionString?.includes('sslmode=require');
+
 export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString,
+  ssl: isRemote ? { rejectUnauthorized: false } : undefined,
 });
 
 export async function withTransaction<T>(

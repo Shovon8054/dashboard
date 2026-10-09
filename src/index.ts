@@ -10,6 +10,7 @@ import { startMqttWorker } from './modules/mqtt/worker';
 
 dotenv.config();
 
+// NorthBridge Production Dashboard API
 const app = express();
 
 // Enable CORS for frontend dev server

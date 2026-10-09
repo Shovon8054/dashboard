@@ -12,7 +12,14 @@ async function runMigrations() {
     process.exit(1);
   }
 
-  const client = new Client({ connectionString: databaseUrl });
+  const isRemote =
+    databaseUrl.includes('supabase.com') || databaseUrl.includes('sslmode=require');
+
+  const client = new Client({
+    connectionString: databaseUrl,
+    ssl: isRemote ? { rejectUnauthorized: false } : undefined,
+  });
+
   await client.connect();
 
   try {

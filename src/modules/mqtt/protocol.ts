@@ -1,59 +1,139 @@
-// MQTT protocol utilities – validation and error handling
-import { ProductionEventPayload } from '../../shared/contracts';
-import { ZodError, z } from 'zod';
-
 export const PROTOCOL_VERSION = '1.0';
 
-// Schema for the incoming challenge payload
-const challengeSchema = z.object({
-  protocol_version: z.literal(PROTOCOL_VERSION),
-  candidate_id: z.string().min(1),
-  challenge_id: z.string().min(1),
-  command: z.literal('PROCESS_EVENTS'),
-  events: z.array(z.object({
-    source_id: z.string().min(1),
-    event_id: z.string().min(1),
-    type: z.enum(['COUNT','VOID']),
-    quantity: z.number().int().positive().optional(),
-    target_event_id: z.string().optional(),
-    event_time: z.string().refine(val => !isNaN(Date.parse(val)), { message: 'invalid ISO date' })
-  })),
-  expires_at: z.string().refine(val => !isNaN(Date.parse(val)), { message: 'invalid expires_at' })
-});
+export type ChallengeErrorCode =
+  | 'VALIDATION_ERROR'
+  | 'CANDIDATE_MISMATCH'
+  | 'UNSUPPORTED_PROTOCOL'
+  | 'CHALLENGE_EXPIRED'
+  | 'CHALLENGE_CONFLICT'
+  | 'INTERNAL_ERROR';
 
-export type MqttChallenge = z.infer<typeof challengeSchema>;
+export interface MqttChallengePayload {
+  protocol_version: string;
+  candidate_id: string;
+  challenge_id: string;
+  command: string;
+  events: any[];
+  expires_at: string;
+}
+
+export type MqttValidationResult =
+  | { ok: true; payload: MqttChallengePayload }
+  | { ok: false; errorCode: ChallengeErrorCode; message: string; challengeId?: string };
 
 /**
- * Validate raw JSON string from MQTT.
- * Returns { ok:true, payload } or { ok:false, errorCode, message }.
+ * Validates the incoming MQTT challenge envelope.
+ * Strictly uses only allowed error codes:
+ * VALIDATION_ERROR, CANDIDATE_MISMATCH, UNSUPPORTED_PROTOCOL,
+ * CHALLENGE_EXPIRED, CHALLENGE_CONFLICT, INTERNAL_ERROR.
  */
-export function validateMqttChallenge(raw: string, myCandidateId: string) {
+export function validateMqttChallenge(
+  raw: string,
+  expectedCandidateId: string
+): MqttValidationResult {
   let parsed: any;
   try {
     parsed = JSON.parse(raw);
-  } catch (e) {
-    return { ok:false, errorCode:'VALIDATION_ERROR', message:'Invalid JSON' } as const;
+  } catch {
+    return {
+      ok: false,
+      errorCode: 'VALIDATION_ERROR',
+      message: 'Invalid JSON payload format',
+    };
   }
 
-  // Quick protocol_version check (before full schema) for better error code
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return {
+      ok: false,
+      errorCode: 'VALIDATION_ERROR',
+      message: 'Challenge payload must be a JSON object',
+    };
+  }
+
+  const challengeId =
+    typeof parsed.challenge_id === 'string' && parsed.challenge_id.trim()
+      ? parsed.challenge_id.trim()
+      : undefined;
+
+  // 1. Protocol version validation
   if (parsed.protocol_version !== PROTOCOL_VERSION) {
-    return { ok:false, errorCode:'UNSUPPORTED_PROTOCOL', message:'Unsupported protocol_version' } as const;
-  }
-  if (parsed.candidate_id !== myCandidateId) {
-    return { ok:false, errorCode:'CANDIDATE_MISMATCH', message:'candidate_id does not match' } as const;
+    return {
+      ok: false,
+      errorCode: 'UNSUPPORTED_PROTOCOL',
+      message: `Unsupported protocol_version "${parsed.protocol_version}". Expected "${PROTOCOL_VERSION}"`,
+      challengeId,
+    };
   }
 
-  try {
-    const payload = challengeSchema.parse(parsed);
-    // expiration check
-    if (new Date(payload.expires_at).getTime() < Date.now()) {
-      return { ok:false, errorCode:'CHALLENGE_EXPIRED', message:'Challenge has expired' } as const;
-    }
-    return { ok:true, payload } as const;
-  } catch (e) {
-    if (e instanceof ZodError) {
-      return { ok:false, errorCode:'VALIDATION_ERROR', message: e.errors.map(err=>err.message).join('; ') } as const;
-    }
-    return { ok:false, errorCode:'VALIDATION_ERROR', message:'Schema validation failed' } as const;
+  // 2. Candidate ID validation
+  if (parsed.candidate_id !== expectedCandidateId) {
+    return {
+      ok: false,
+      errorCode: 'CANDIDATE_MISMATCH',
+      message: `candidate_id "${parsed.candidate_id}" does not match configured candidate ID`,
+      challengeId,
+    };
   }
+
+  // 3. Challenge ID presence
+  if (!challengeId) {
+    return {
+      ok: false,
+      errorCode: 'VALIDATION_ERROR',
+      message: 'challenge_id is required and non-empty',
+      challengeId,
+    };
+  }
+
+  // 4. Command validation
+  if (parsed.command !== 'PROCESS_EVENTS') {
+    return {
+      ok: false,
+      errorCode: 'VALIDATION_ERROR',
+      message: `Invalid command "${parsed.command}". Expected "PROCESS_EVENTS"`,
+      challengeId,
+    };
+  }
+
+  // 5. Events array validation
+  if (!Array.isArray(parsed.events)) {
+    return {
+      ok: false,
+      errorCode: 'VALIDATION_ERROR',
+      message: 'events must be an array',
+      challengeId,
+    };
+  }
+
+  // 6. Expiration check (expires_at)
+  if (!parsed.expires_at || isNaN(Date.parse(parsed.expires_at))) {
+    return {
+      ok: false,
+      errorCode: 'VALIDATION_ERROR',
+      message: 'expires_at must be a valid ISO 8601 date string',
+      challengeId,
+    };
+  }
+
+  const expiresTime = new Date(parsed.expires_at).getTime();
+  if (expiresTime <= Date.now()) {
+    return {
+      ok: false,
+      errorCode: 'CHALLENGE_EXPIRED',
+      message: `Challenge expired at ${parsed.expires_at}`,
+      challengeId,
+    };
+  }
+
+  return {
+    ok: true,
+    payload: {
+      protocol_version: parsed.protocol_version,
+      candidate_id: parsed.candidate_id,
+      challenge_id: challengeId,
+      command: parsed.command,
+      events: parsed.events,
+      expires_at: parsed.expires_at,
+    },
+  };
 }

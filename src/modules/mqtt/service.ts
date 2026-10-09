@@ -1,10 +1,18 @@
 import crypto from 'crypto';
-import { validateMqttChallenge, PROTOCOL_VERSION, MqttChallenge } from './protocol';
-import { upsertChallenge, storeChallengeResponse, getMqttStats } from './repository';
+import {
+  validateMqttChallenge,
+  PROTOCOL_VERSION,
+  MqttChallengePayload,
+} from './protocol';
+import {
+  upsertChallenge,
+  storeChallengeResponse,
+  getMqttStats,
+} from './repository';
 import { processBatch } from '../events/service';
 import { getSummary } from '../state/queries';
 import { runtimeMqttStatus } from './status';
-import { pool, withTransaction } from '../../shared/db';
+import { pool } from '../../shared/db';
 import { publishMqttMessage } from './worker';
 
 export async function handleMqttChallenge(message: Buffer) {
@@ -14,21 +22,13 @@ export async function handleMqttChallenge(message: Buffer) {
   const responseTopic = `${topicBase}/response`;
   const statusTopic = `${topicBase}/status`;
 
-  // 1. Validate envelope
+  // 1. Envelope validation
   const validation = validateMqttChallenge(rawMsg, myCandidateId);
   if (!validation.ok) {
-    let parsedChallengeId: string | undefined = undefined;
-    try {
-      const parsed = JSON.parse(rawMsg);
-      if (typeof parsed?.challenge_id === 'string') {
-        parsedChallengeId = parsed.challenge_id;
-      }
-    } catch {}
-
     const failPayload = {
       protocol_version: PROTOCOL_VERSION,
       candidate_id: myCandidateId,
-      challenge_id: parsedChallengeId || 'unknown',
+      challenge_id: validation.challengeId || 'unknown',
       status: 'FAILED',
       error_code: validation.errorCode,
       message: validation.message,
@@ -39,12 +39,40 @@ export async function handleMqttChallenge(message: Buffer) {
     runtimeMqttStatus.failed_count++;
     runtimeMqttStatus.total_count++;
 
-    publishMqttMessage(responseTopic, JSON.stringify(failPayload));
-    publishMqttMessage(statusTopic, JSON.stringify(failPayload));
+    const failStr = JSON.stringify(failPayload);
+    publishMqttMessage(responseTopic, failStr);
+
+    // If challengeId is available, record failure in DB
+    if (validation.challengeId) {
+      const client = await pool.connect();
+      try {
+        const dummyDigest = crypto
+          .createHash('sha256')
+          .update(rawMsg)
+          .digest('hex');
+        await upsertChallenge(
+          client,
+          validation.challengeId,
+          dummyDigest,
+          { raw: rawMsg },
+          'FAILED',
+          validation.errorCode
+        );
+        await storeChallengeResponse(
+          client,
+          validation.challengeId,
+          failPayload,
+          'FAILED',
+          validation.errorCode
+        );
+      } catch {} finally {
+        client.release();
+      }
+    }
     return;
   }
 
-  const payload = validation.payload as MqttChallenge;
+  const payload: MqttChallengePayload = validation.payload;
   const challengeId = payload.challenge_id;
   const nowIso = new Date().toISOString();
 
@@ -57,7 +85,6 @@ export async function handleMqttChallenge(message: Buffer) {
     .update(JSON.stringify(payload))
     .digest('hex');
 
-  // Idempotency check via DB
   const client = await pool.connect();
   try {
     const stored = await upsertChallenge(
@@ -68,15 +95,15 @@ export async function handleMqttChallenge(message: Buffer) {
       'PENDING'
     );
 
-    // If stored challenge already has a response
+    // 2. Idempotency Check
     if (stored.response_body) {
       if (stored.request_digest === requestDigest) {
-        // Idempotent retry: republish original response
-        const resp = typeof stored.response_body === 'string'
-          ? stored.response_body
-          : JSON.stringify(stored.response_body);
+        // Same ID + same body -> republish stored original response, do NOT reprocess
+        const resp =
+          typeof stored.response_body === 'string'
+            ? stored.response_body
+            : JSON.stringify(stored.response_body);
         publishMqttMessage(responseTopic, resp);
-        publishMqttMessage(statusTopic, resp);
         runtimeMqttStatus.last_response_status = stored.status;
         return;
       } else {
@@ -89,20 +116,24 @@ export async function handleMqttChallenge(message: Buffer) {
           error_code: 'CHALLENGE_CONFLICT',
           message: 'Same challenge_id submitted with conflicting payload',
         };
-        await storeChallengeResponse(client, challengeId, conflictPayload, 'FAILED', 'CHALLENGE_CONFLICT');
+        await storeChallengeResponse(
+          client,
+          challengeId,
+          conflictPayload,
+          'FAILED',
+          'CHALLENGE_CONFLICT'
+        );
         runtimeMqttStatus.last_error = conflictPayload.message;
         runtimeMqttStatus.last_response_status = 'FAILED';
         runtimeMqttStatus.failed_count++;
         runtimeMqttStatus.total_count++;
 
-        const respStr = JSON.stringify(conflictPayload);
-        publishMqttMessage(responseTopic, respStr);
-        publishMqttMessage(statusTopic, respStr);
+        publishMqttMessage(responseTopic, JSON.stringify(conflictPayload));
         return;
       }
     }
 
-    // Process events using the exact same processBatch as REST
+    // 3. Process events via the exact same processBatch() as REST
     let batchResults;
     try {
       batchResults = await processBatch(payload.events);
@@ -115,19 +146,23 @@ export async function handleMqttChallenge(message: Buffer) {
         error_code: 'INTERNAL_ERROR',
         message: err?.message || 'Internal processing error',
       };
-      await storeChallengeResponse(client, challengeId, internalErrorPayload, 'FAILED', 'INTERNAL_ERROR');
+      await storeChallengeResponse(
+        client,
+        challengeId,
+        internalErrorPayload,
+        'FAILED',
+        'INTERNAL_ERROR'
+      );
       runtimeMqttStatus.last_error = internalErrorPayload.message;
       runtimeMqttStatus.last_response_status = 'FAILED';
       runtimeMqttStatus.failed_count++;
       runtimeMqttStatus.total_count++;
 
-      const respStr = JSON.stringify(internalErrorPayload);
-      publishMqttMessage(responseTopic, respStr);
-      publishMqttMessage(statusTopic, respStr);
+      publishMqttMessage(responseTopic, JSON.stringify(internalErrorPayload));
       return;
     }
 
-    // Fetch state summary
+    // 4. Build State Summary
     const stateSummary = await getSummary();
 
     const successPayload = {
@@ -149,9 +184,8 @@ export async function handleMqttChallenge(message: Buffer) {
     runtimeMqttStatus.completed_count++;
     runtimeMqttStatus.total_count++;
 
-    const respStr = JSON.stringify(successPayload);
-    publishMqttMessage(responseTopic, respStr);
-    publishMqttMessage(statusTopic, respStr);
+    // Publish to response topic (QoS 1, retain false)
+    publishMqttMessage(responseTopic, JSON.stringify(successPayload));
   } finally {
     client.release();
   }
