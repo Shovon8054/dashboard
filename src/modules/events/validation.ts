@@ -34,13 +34,19 @@ function normalize(payload: ProductionEventPayload): ProductionEventPayload {
 export function validateEvent(raw: any):
   | { ok: true; value: ProductionEventPayload }
   | { ok: false; reason: string } {
+  const MAX_COUNT_QUANTITY = 500;
   try {
     const parsed = eventSchema.parse(raw);
     const normalized = normalize(parsed as ProductionEventPayload);
     // Additional logical checks
     if (normalized.type === 'COUNT') {
-      if (normalized.quantity == null || normalized.quantity <= 0) {
-        return { ok: false, reason: 'COUNT must have positive quantity' };
+      if (
+        normalized.quantity == null ||
+        !Number.isInteger(normalized.quantity) ||
+        normalized.quantity < 1 ||
+        normalized.quantity > MAX_COUNT_QUANTITY
+      ) {
+        return { ok: false, reason: `quantity must be between 1 and ${MAX_COUNT_QUANTITY}` };
       }
       if (normalized.target_event_id) {
         return { ok: false, reason: 'COUNT must not include target_event_id' };

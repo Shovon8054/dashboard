@@ -36,7 +36,9 @@ export async function getSummary(sourceId?: string) {
         -- duplicates attempts count (filtered by source if supplied)
         (SELECT COUNT(*) FROM submission_attempts WHERE classification = 'DUPLICATE' ${sourceId ? "AND source_id = $1" : ''}) AS duplicates,
         -- conflict attempts count (filtered by source if supplied)
-        (SELECT COUNT(*) FROM submission_attempts WHERE classification = 'CONFLICT' ${sourceId ? "AND source_id = $1" : ''}) AS conflicts
+        (SELECT COUNT(*) FROM submission_attempts WHERE classification = 'CONFLICT' ${sourceId ? "AND source_id = $1" : ''}) AS conflicts,
+        -- rejected attempts count (filtered by source if supplied)
+        (SELECT COUNT(*) FROM submission_attempts WHERE classification = 'REJECTED' ${sourceId ? "AND source_id = $1" : ''}) AS rejected_submissions
       FROM production_events
       WHERE 1=1 ${srcFilter};
     `;
@@ -50,6 +52,7 @@ export async function getSummary(sourceId?: string) {
       unresolved: Number(row.unresolved),
       duplicates: Number(row.duplicates),
       conflicts: Number(row.conflicts),
+      rejected_submissions: Number(row.rejected_submissions),
     };
   } finally {
     client.release();

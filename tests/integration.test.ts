@@ -329,4 +329,262 @@ describe('Production Event Processing System (Integration Tests)', () => {
     expect(rejections.length).toBe(1);
     expect(rejections[0].event_id).toBe('batch-invalid');
   });
+
+  // Change Request Tests:
+  // 1. COUNT 450 -> ACCEPTED, total increases by 450.
+  it('CR 1: COUNT 450 -> ACCEPTED, total increases by 450', async () => {
+    const payload = {
+      source_id: 'line-valid-450',
+      event_id: 'evt-count-450',
+      type: 'COUNT',
+      quantity: 450,
+      event_time: '2026-10-09T10:00:00.000Z',
+    };
+
+    const result = await processEvent(payload);
+    expect(result.status).toBe('ACCEPTED');
+
+    const summary = await getSummary();
+    expect(summary.net_total).toBe(450);
+  });
+
+  // 2. COUNT 500 -> ACCEPTED (boundary).
+  it('CR 2: COUNT 500 -> ACCEPTED (boundary)', async () => {
+    const payload = {
+      source_id: 'line-boundary-500',
+      event_id: 'evt-count-500',
+      type: 'COUNT',
+      quantity: 500,
+      event_time: '2026-10-09T10:00:00.000Z',
+    };
+
+    const result = await processEvent(payload);
+    expect(result.status).toBe('ACCEPTED');
+
+    const summary = await getSummary();
+    expect(summary.net_total).toBe(500);
+
+    const { rows } = await pool.query(
+      'SELECT * FROM production_events WHERE event_id = $1',
+      ['evt-count-500']
+    );
+    expect(rows.length).toBe(1);
+    expect(Number(rows[0].quantity)).toBe(500);
+  });
+
+  // 3. COUNT 501 -> REJECTED, total unchanged, attempt stored in PostgreSQL.
+  it('CR 3: COUNT 501 -> REJECTED, total unchanged, attempt stored in PostgreSQL', async () => {
+    const payload = {
+      source_id: 'line-overlimit-501',
+      event_id: 'evt-count-501',
+      type: 'COUNT',
+      quantity: 501,
+      event_time: '2026-10-09T10:00:00.000Z',
+    };
+
+    const result = await processEvent(payload);
+    expect(result.status).toBe('REJECTED');
+    expect(result.reason).toContain('quantity must be between 1 and 500');
+
+    // Total unchanged
+    const summary = await getSummary();
+    expect(summary.net_total).toBe(0);
+
+    // No row in production_events
+    const { rows: events } = await pool.query(
+      'SELECT * FROM production_events WHERE event_id = $1',
+      ['evt-count-501']
+    );
+    expect(events.length).toBe(0);
+
+    // Attempt stored in submission_attempts
+    const { rows: attempts } = await pool.query(
+      'SELECT * FROM submission_attempts WHERE event_id = $1',
+      ['evt-count-501']
+    );
+    expect(attempts.length).toBe(1);
+    expect(attempts[0].classification).toBe('REJECTED');
+    expect(attempts[0].error).toContain('quantity must be between 1 and 500');
+  });
+
+  // 4. Same 501 COUNT through the MQTT challenge handler -> REJECTED item inside a COMPLETED response.
+  it('CR 4: Same 501 COUNT through MQTT challenge handler -> REJECTED item inside a COMPLETED response', async () => {
+    process.env.CANDIDATE_ID = 'test-candidate-123';
+    const challengeId = 'chal-mqtt-501';
+
+    const challenge = {
+      protocol_version: PROTOCOL_VERSION,
+      candidate_id: 'test-candidate-123',
+      challenge_id: challengeId,
+      command: 'PROCESS_EVENTS',
+      events: [
+        {
+          source_id: 'mqtt-station-overlimit',
+          event_id: 'mqtt-evt-501',
+          type: 'COUNT',
+          quantity: 501,
+          event_time: '2026-10-09T10:05:00.000Z',
+        },
+      ],
+      expires_at: new Date(Date.now() + 60000).toISOString(),
+    };
+
+    const rawBuffer = Buffer.from(JSON.stringify(challenge));
+    await handleMqttChallenge(rawBuffer);
+
+    const { rows } = await pool.query(
+      'SELECT * FROM mqtt_challenges WHERE challenge_id = $1',
+      [challengeId]
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].status).toBe('COMPLETED');
+
+    const responseBody =
+      typeof rows[0].response_body === 'string'
+        ? JSON.parse(rows[0].response_body)
+        : rows[0].response_body;
+
+    expect(responseBody.status).toBe('COMPLETED');
+    expect(responseBody.results).toHaveLength(1);
+    expect(responseBody.results[0].event_id).toBe('mqtt-evt-501');
+    expect(responseBody.results[0].status).toBe('REJECTED');
+  });
+
+  // 5. get_summary(): rejected_submissions counts only REJECTED (not duplicates, conflicts, pending), returns 0 when none, and respects source_id.
+  it('CR 5: get_summary(): rejected_submissions counts only REJECTED, returns 0 when none, respects source_id', async () => {
+    // 0 when none
+    const emptySummary = await getSummary();
+    expect(emptySummary.rejected_submissions).toBe(0);
+
+    // Accepted COUNT on source-A
+    await processEvent({
+      source_id: 'source-A',
+      event_id: 'evt-base-A',
+      type: 'COUNT',
+      quantity: 10,
+      event_time: '2026-10-09T10:00:00.000Z',
+    });
+
+    // DUPLICATE attempt on source-A
+    await processEvent({
+      source_id: 'source-A',
+      event_id: 'evt-base-A',
+      type: 'COUNT',
+      quantity: 10,
+      event_time: '2026-10-09T10:00:00.000Z',
+    });
+
+    // CONFLICT attempt on source-A
+    await processEvent({
+      source_id: 'source-A',
+      event_id: 'evt-base-A',
+      type: 'COUNT',
+      quantity: 20,
+      event_time: '2026-10-09T10:00:00.000Z',
+    });
+
+    // Unresolved VOID (pending reference) on source-A
+    await processEvent({
+      source_id: 'source-A',
+      event_id: 'evt-void-unresolved',
+      type: 'VOID',
+      target_event_id: 'non-existent-target',
+      event_time: '2026-10-09T10:01:00.000Z',
+    });
+
+    // REJECTED attempt on source-A (quantity > 500)
+    await processEvent({
+      source_id: 'source-A',
+      event_id: 'evt-rej-A',
+      type: 'COUNT',
+      quantity: 505,
+      event_time: '2026-10-09T10:02:00.000Z',
+    });
+
+    // REJECTED attempt on source-B
+    await processEvent({
+      source_id: 'source-B',
+      event_id: 'evt-rej-B',
+      type: 'COUNT',
+      quantity: 520,
+      event_time: '2026-10-09T10:02:00.000Z',
+    });
+
+    // Global summary
+    const globalSummary = await getSummary();
+    expect(globalSummary.rejected_submissions).toBe(2);
+    expect(globalSummary.duplicates).toBe(1);
+    expect(globalSummary.conflicts).toBe(1);
+    expect(globalSummary.unresolved).toBe(1);
+    expect(globalSummary.net_total).toBe(10);
+
+    // Filtered by source-A
+    const summaryA = await getSummary('source-A');
+    expect(summaryA.rejected_submissions).toBe(1);
+    expect(summaryA.duplicates).toBe(1);
+    expect(summaryA.conflicts).toBe(1);
+    expect(summaryA.unresolved).toBe(1);
+    expect(summaryA.net_total).toBe(10);
+
+    // Filtered by source-B
+    const summaryB = await getSummary('source-B');
+    expect(summaryB.rejected_submissions).toBe(1);
+    expect(summaryB.duplicates).toBe(0);
+    expect(summaryB.conflicts).toBe(0);
+    expect(summaryB.net_total).toBe(0);
+
+    // Filtered by source-C (none)
+    const summaryC = await getSummary('source-C');
+    expect(summaryC.rejected_submissions).toBe(0);
+  });
+
+  // 6. MQTT response state includes rejected_submissions.
+  it('CR 6: MQTT response state includes rejected_submissions', async () => {
+    // Generate 1 rejected submission first
+    await processEvent({
+      source_id: 'mqtt-line-rej',
+      event_id: 'rej-before-mqtt',
+      type: 'COUNT',
+      quantity: 505,
+      event_time: '2026-10-09T10:00:00.000Z',
+    });
+
+    process.env.CANDIDATE_ID = 'test-candidate-123';
+    const challengeId = 'chal-mqtt-state-check';
+
+    const challenge = {
+      protocol_version: PROTOCOL_VERSION,
+      candidate_id: 'test-candidate-123',
+      challenge_id: challengeId,
+      command: 'PROCESS_EVENTS',
+      events: [
+        {
+          source_id: 'mqtt-line-rej',
+          event_id: 'mqtt-valid-evt',
+          type: 'COUNT',
+          quantity: 20,
+          event_time: '2026-10-09T10:10:00.000Z',
+        },
+      ],
+      expires_at: new Date(Date.now() + 60000).toISOString(),
+    };
+
+    await handleMqttChallenge(Buffer.from(JSON.stringify(challenge)));
+
+    const { rows } = await pool.query(
+      'SELECT response_body FROM mqtt_challenges WHERE challenge_id = $1',
+      [challengeId]
+    );
+    expect(rows.length).toBe(1);
+
+    const responseBody =
+      typeof rows[0].response_body === 'string'
+        ? JSON.parse(rows[0].response_body)
+        : rows[0].response_body;
+
+    expect(responseBody.state).toBeDefined();
+    expect(responseBody.state).toHaveProperty('rejected_submissions');
+    expect(responseBody.state.rejected_submissions).toBe(1);
+    expect(responseBody.state.net_total).toBe(20);
+  });
 });

@@ -5,6 +5,7 @@ export interface StateSummary {
   unresolved: number;
   duplicates: number;
   conflicts: number;
+  rejected_submissions: number;
 }
 
 export interface PendingEvent {

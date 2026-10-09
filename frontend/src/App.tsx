@@ -49,14 +49,15 @@ function KpiCard({ label, value, accent, sub }: KpiProps) {
 
 // ─── Main App ─────────────────────────────────────────────────
 export default function App() {
-  const [sourceIdFilter, setSourceIdFilter] = useState('');
+  const [sourceInput, setSourceInput] = useState('');
+  const [selectedSource, setSelectedSource] = useState('');
   const [activeTab, setActiveTab] = useState<'pending' | 'exceptions'>('pending');
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
 
   const [summary, setSummary] = useState<StateSummary>({
     net_total: 0, processed_events: 0, pending_ack: 0,
-    unresolved: 0, duplicates: 0, conflicts: 0,
+    unresolved: 0, duplicates: 0, conflicts: 0, rejected_submissions: 0,
   });
   const [pendingList, setPendingList] = useState<PendingEvent[]>([]);
   const [exceptionsList, setExceptionsList] = useState<ExceptionItem[]>([]);
@@ -87,9 +88,9 @@ export default function App() {
     setGlobalError(null);
     try {
       const [sumData, pendData, excData, mqttData] = await Promise.all([
-        getStateSummary(sourceIdFilter),
-        getPendingEvents(sourceIdFilter),
-        getExceptions(sourceIdFilter),
+        getStateSummary(selectedSource),
+        getPendingEvents(selectedSource),
+        getExceptions(selectedSource),
         getMqttStatus().catch(() => null),
       ]);
       setSummary(sumData);
@@ -102,7 +103,7 @@ export default function App() {
     } finally {
       setIsLoading(false);
     }
-  }, [sourceIdFilter]);
+  }, [selectedSource]);
 
   useEffect(() => {
     fetchData();
@@ -229,13 +230,40 @@ export default function App() {
 
         <div className="header-controls">
           <LiveClock />
-          <input
-            type="text"
-            className="input-filter"
-            placeholder="Filter by Source ID…"
-            value={sourceIdFilter}
-            onChange={(e) => setSourceIdFilter(e.target.value)}
-          />
+          <form
+            className="filter-form"
+            onSubmit={(e) => {
+              e.preventDefault();
+              setSelectedSource(sourceInput.trim());
+            }}
+          >
+            <input
+              type="text"
+              className="input-filter"
+              placeholder="LINE-01"
+              value={sourceInput}
+              onChange={(e) => setSourceInput(e.target.value)}
+            />
+            <button type="submit" className="btn btn-secondary btn-sm">
+              Apply
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              onClick={() => {
+                setSourceInput('');
+                setSelectedSource('');
+              }}
+              disabled={!sourceInput && !selectedSource}
+            >
+              Clear
+            </button>
+          </form>
+          {selectedSource && (
+            <span className="badge-source">
+              Source: {selectedSource}
+            </span>
+          )}
           <button
             className={`btn btn-secondary btn-sm`}
             onClick={() => setAutoRefresh(!autoRefresh)}
@@ -280,6 +308,7 @@ export default function App() {
           <KpiCard label="Unresolved" value={summary.unresolved} accent="purple" sub="pending VOIDs" />
           <KpiCard label="Duplicates" value={summary.duplicates} accent="slate" sub="suppressed" />
           <KpiCard label="Conflicts" value={summary.conflicts} accent="rose" sub="payload mismatch" />
+          <KpiCard label="Rejected Submissions" value={summary.rejected_submissions ?? 0} accent="crimson" sub="invalid payloads" />
         </section>
 
         {/* ── Split: Ingest + MQTT ── */}
@@ -486,11 +515,19 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {pendingList.length === 0 ? (
+                  {isLoading ? (
+                    <tr>
+                      <td colSpan={8} className="empty-state">
+                        <span className="spinner" /> Loading pending events…
+                      </td>
+                    </tr>
+                  ) : pendingList.length === 0 ? (
                     <tr>
                       <td colSpan={8} className="empty-state">
                         <span className="empty-icon">✅</span>
-                        No COUNT events pending acknowledgement
+                        {selectedSource
+                          ? `No pending events for source "${selectedSource}"`
+                          : 'No COUNT events pending acknowledgement'}
                       </td>
                     </tr>
                   ) : (
@@ -532,11 +569,19 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {exceptionsList.length === 0 ? (
+                  {isLoading ? (
+                    <tr>
+                      <td colSpan={5} className="empty-state">
+                        <span className="spinner" /> Loading exceptions…
+                      </td>
+                    </tr>
+                  ) : exceptionsList.length === 0 ? (
                     <tr>
                       <td colSpan={5} className="empty-state">
                         <span className="empty-icon">✅</span>
-                        No exceptions or unresolved references
+                        {selectedSource
+                          ? `No exceptions for source "${selectedSource}"`
+                          : 'No exceptions or unresolved references'}
                       </td>
                     </tr>
                   ) : (
