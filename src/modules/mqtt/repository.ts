@@ -61,6 +61,20 @@ export async function getChallengeById(challengeId: string) {
   }
 }
 
+export async function getLastChallenge() {
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(
+      `SELECT challenge_id, received_at, status, error_code 
+       FROM mqtt_challenges 
+       ORDER BY id DESC LIMIT 1`
+    );
+    return rows[0] || null;
+  } finally {
+    client.release();
+  }
+}
+
 export async function getMqttStats() {
   const client = await pool.connect();
   try {

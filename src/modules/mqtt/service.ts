@@ -8,6 +8,7 @@ import {
   upsertChallenge,
   storeChallengeResponse,
   getMqttStats,
+  getLastChallenge,
 } from './repository';
 import { processBatch } from '../events/service';
 import { getSummary } from '../state/queries';
@@ -193,15 +194,23 @@ export async function handleMqttChallenge(message: Buffer) {
 
 export async function getMqttStatus() {
   try {
-    const stats = await getMqttStats();
+    const [stats, lastChallenge] = await Promise.all([
+      getMqttStats(),
+      getLastChallenge().catch(() => null),
+    ]);
     return {
       connected: runtimeMqttStatus.connected,
       candidate_id: process.env.CANDIDATE_ID || '',
       client_id: runtimeMqttStatus.client_id,
-      last_challenge_id: runtimeMqttStatus.last_challenge_id,
-      last_challenge_time: runtimeMqttStatus.last_challenge_time,
-      last_response_status: runtimeMqttStatus.last_response_status,
-      last_error: runtimeMqttStatus.last_error,
+      last_challenge_id:
+        runtimeMqttStatus.last_challenge_id || lastChallenge?.challenge_id || null,
+      last_challenge_time:
+        runtimeMqttStatus.last_challenge_time ||
+        (lastChallenge?.received_at ? new Date(lastChallenge.received_at).toISOString() : null),
+      last_response_status:
+        runtimeMqttStatus.last_response_status || lastChallenge?.status || null,
+      last_error:
+        runtimeMqttStatus.last_error || lastChallenge?.error_code || null,
       challenge_counts: {
         completed: Math.max(runtimeMqttStatus.completed_count, stats.completed),
         failed: Math.max(runtimeMqttStatus.failed_count, stats.failed),
