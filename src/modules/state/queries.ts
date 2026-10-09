@@ -22,13 +22,7 @@ export async function getSummary(sourceId?: string) {
         -- net_total = accepted COUNT qty minus voided COUNT qty
         COALESCE(
           SUM(CASE 
-                WHEN type = 'COUNT' AND void_event_id IS NULL THEN quantity 
-                ELSE 0 
-              END),
-          0
-        ) - COALESCE(
-          SUM(CASE 
-                WHEN type = 'COUNT' AND void_event_id IS NOT NULL THEN quantity 
+                WHEN type = 'COUNT' AND status = 'ACCEPTED' AND void_event_id IS NULL THEN quantity 
                 ELSE 0 
               END),
           0

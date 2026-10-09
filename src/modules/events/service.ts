@@ -44,6 +44,9 @@ export async function processEvent(raw: any): Promise<SubmissionResult> {
   const domainEventsToEmit: Array<{ type: 'EVENT_ACCEPTED' | 'VOID_RESOLVED'; payload: any }> = [];
 
   const result = await withTransaction(async (client: PoolClient) => {
+    // Advisory transaction lock prevents concurrent insert races for the same event_id
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [payload.event_id]);
+
     // Check if event_id already exists (duplicate or conflict)
     const existing = await findEventById(client, payload.event_id, true);
     if (existing) {
