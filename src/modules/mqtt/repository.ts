@@ -1,19 +1,13 @@
 import { PoolClient } from 'pg';
 import { pool } from '../../shared/db';
-import crypto from 'crypto';
 
-/**
- * Insert a new challenge or return existing one (idempotency).
- * Returns the full row (including any stored response_body).
- */
 export async function upsertChallenge(
   client: PoolClient,
   challengeId: string,
   requestDigest: string,
   requestBody: any,
   status: string,
-  errorCode?: string,
-  errorMessage?: string
+  errorCode?: string
 ) {
   const result = await client.query(
     `INSERT INTO mqtt_challenges (
@@ -22,36 +16,38 @@ export async function upsertChallenge(
         request_body,
         status,
         error_code,
-        error_message,
         received_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,NOW())
-      ON CONFLICT (challenge_id) DO UPDATE SET
-        request_body = EXCLUDED.request_body,
-        request_digest = EXCLUDED.request_digest,
-        status = EXCLUDED.status,
-        error_code = EXCLUDED.error_code,
-        error_message = EXCLUDED.error_message,
-        responded_at = NOW()
+      ) VALUES ($1, $2, $3, $4, $5, NOW())
+      ON CONFLICT (challenge_id) DO NOTHING
       RETURNING *`,
-    [challengeId, requestDigest, requestBody, status, errorCode || null, errorMessage || null]
+    [challengeId, requestDigest, JSON.stringify(requestBody), status, errorCode || null]
   );
-  return result.rows[0];
+  if (result.rows.length > 0) {
+    return result.rows[0];
+  }
+  // If already exists, fetch existing row
+  const existing = await client.query(
+    `SELECT * FROM mqtt_challenges WHERE challenge_id = $1`,
+    [challengeId]
+  );
+  return existing.rows[0];
 }
 
-/** Store the final response payload for a challenge (idempotent). */
 export async function storeChallengeResponse(
   client: PoolClient,
   challengeId: string,
   responseBody: any,
-  status: string
+  status: string,
+  errorCode?: string
 ) {
   await client.query(
-    `UPDATE mqtt_challenges SET response_body = $1, status = $2, responded_at = NOW() WHERE challenge_id = $3`,
-    [responseBody, status, challengeId]
+    `UPDATE mqtt_challenges 
+     SET response_body = $1, status = $2, error_code = $3, responded_at = NOW() 
+     WHERE challenge_id = $4`,
+    [JSON.stringify(responseBody), status, errorCode || null, challengeId]
   );
 }
 
-/** Retrieve a challenge record (including stored response_body). */
 export async function getChallengeById(challengeId: string) {
   const client = await pool.connect();
   try {
@@ -65,18 +61,21 @@ export async function getChallengeById(challengeId: string) {
   }
 }
 
-/** Simple stats for MQTT status endpoint */
 export async function getMqttStats() {
   const client = await pool.connect();
   try {
     const { rows } = await client.query(
       `SELECT 
-         COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
-         COUNT(*) FILTER (WHERE status = 'FAILED') AS failed,
-         COUNT(*) AS total
+         COUNT(*) FILTER (WHERE status = 'COMPLETED')::int AS completed,
+         COUNT(*) FILTER (WHERE status = 'FAILED')::int AS failed,
+         COUNT(*)::int AS total
        FROM mqtt_challenges`
     );
-    return rows[0];
+    return {
+      completed: Number(rows[0]?.completed || 0),
+      failed: Number(rows[0]?.failed || 0),
+      total: Number(rows[0]?.total || 0),
+    };
   } finally {
     client.release();
   }

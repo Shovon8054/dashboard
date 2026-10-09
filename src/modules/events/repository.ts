@@ -1,18 +1,25 @@
 import { PoolClient } from 'pg';
 import { ProductionEventPayload, EventStatus } from '../../shared/contracts';
-import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 
-/**
- * Inserts a production event row.
- * Returns the inserted row (including generated id).
- */
+export async function ensureSource(client: PoolClient, sourceId: string) {
+  await client.query(
+    `INSERT INTO production_sources (source_id, display_name) 
+     VALUES ($1, $1) 
+     ON CONFLICT (source_id) DO NOTHING`,
+    [sourceId]
+  );
+}
+
 export async function insertEvent(
   client: PoolClient,
   payload: ProductionEventPayload,
   status: EventStatus,
-  voidEventId: string | null = null
+  voidEventId: string | null = null,
+  acknowledgedAt: Date | null = null
 ) {
+  await ensureSource(client, payload.source_id);
+
   const result = await client.query(
     `INSERT INTO production_events (
         event_id,
@@ -22,26 +29,25 @@ export async function insertEvent(
         target_event_id,
         event_time,
         status,
-        void_event_id
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        void_event_id,
+        acknowledged_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING *`,
     [
       payload.event_id,
       payload.source_id,
       payload.type,
-      payload.quantity,
-      payload.target_event_id,
+      payload.quantity ?? null,
+      payload.target_event_id ?? null,
       payload.event_time,
       status,
       voidEventId,
+      acknowledgedAt,
     ]
   );
   return result.rows[0];
 }
 
-/**
- * Logs every submission attempt (including rejections, duplicates, conflicts).
- */
 export async function insertSubmissionAttempt(
   client: PoolClient,
   sourceId: string | null,
@@ -59,14 +65,11 @@ export async function insertSubmissionAttempt(
         payload_digest,
         classification,
         error
-      ) VALUES ($1,$2,$3,$4,$5,$6)`,
-    [sourceId, eventId, rawPayload, digest, classification, error || null]
+      ) VALUES ($1, $2, $3, $4, $5, $6)`,
+    [sourceId, eventId, JSON.stringify(rawPayload), digest, classification, error || null]
   );
 }
 
-/**
- * Finds an event by its event_id (FOR UPDATE if lock===true).
- */
 export async function findEventById(
   client: PoolClient,
   eventId: string,
@@ -79,10 +82,6 @@ export async function findEventById(
   return rows[0] || null;
 }
 
-/**
- * Retrieves pending VOID events that reference the given target COUNT event.
- * Rows are ordered by received_at so the first stored wins.
- */
 export async function getPendingVoids(
   client: PoolClient,
   targetEventId: string
@@ -92,62 +91,43 @@ export async function getPendingVoids(
      WHERE type = 'VOID' 
        AND target_event_id = $1 
        AND status = 'PENDING_REFERENCE' 
-     ORDER BY received_at ASC FOR UPDATE`,
+     ORDER BY received_at ASC, id ASC FOR UPDATE`,
     [targetEventId]
   );
   return rows;
 }
 
-/**
- * Accept a VOID event and mark the corresponding COUNT as voided.
- * Updates both rows inside the same transaction.
- */
-export async function acceptVoid(
+export async function resolvePendingVoid(
   client: PoolClient,
-  voidRow: any,
-  countRow: any
+  voidRowId: number,
+  voidEventId: string,
+  targetCountId: number
 ) {
-  // Update VOID status
+  // Accept and auto-acknowledge the VOID
   await client.query(
-    `UPDATE production_events SET status = 'ACCEPTED', acknowledged_at = NOW() WHERE id = $1`,
-    [voidRow.id]
+    `UPDATE production_events 
+     SET status = 'ACCEPTED', acknowledged_at = NOW() 
+     WHERE id = $1`,
+    [voidRowId]
   );
-  // Link the COUNT to its void and mark voided
-  await client.query(
-    `UPDATE production_events SET void_event_id = $1, status = 'REJECTED' WHERE id = $2`,
-    [voidRow.event_id, countRow.id]
-  );
-}
 
-/**
- * Reject a VOID event (used when another VOID already resolved the COUNT or when
- * the target COUNT is missing).
- */
-export async function rejectVoid(
-  client: PoolClient,
-  voidRow: any,
-  reason: string
-) {
+  // Link the COUNT to the resolving VOID
   await client.query(
-    `UPDATE production_events SET status = 'REJECTED', error = $1 WHERE id = $2`,
-    [reason, voidRow.id]
+    `UPDATE production_events 
+     SET void_event_id = $1 
+     WHERE id = $2`,
+    [voidEventId, targetCountId]
   );
 }
 
-/**
- * Marks a COUNT as pending reference when its VOID arrives before the COUNT.
- */
-export async function insertPendingVoid(
+export async function rejectPendingVoid(
   client: PoolClient,
-  payload: ProductionEventPayload,
-  status: EventStatus = 'PENDING_REFERENCE'
+  voidRowId: number
 ) {
-  return insertEvent(client, payload, status);
-}
-
-/**
- * Emits a domain event after DB commit (caller handles emission).
- */
-export async function emitDomainEvents(events: Array<{ type: string; payload: any }>) {
-  // Placeholder – real emission is done by the service layer after the transaction.
+  await client.query(
+    `UPDATE production_events 
+     SET status = 'REJECTED' 
+     WHERE id = $1`,
+    [voidRowId]
+  );
 }

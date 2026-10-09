@@ -17,7 +17,7 @@ const challengeSchema = z.object({
     quantity: z.number().int().positive().optional(),
     target_event_id: z.string().optional(),
     event_time: z.string().refine(val => !isNaN(Date.parse(val)), { message: 'invalid ISO date' })
-  }))),
+  })),
   expires_at: z.string().refine(val => !isNaN(Date.parse(val)), { message: 'invalid expires_at' })
 });
 

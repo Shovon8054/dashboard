@@ -1,5 +1,5 @@
 import { PoolClient } from 'pg';
-import { 
+import {
   ProductionEventPayload,
   EventStatus,
   SubmissionResult,
@@ -10,35 +10,30 @@ import {
   insertSubmissionAttempt,
   findEventById,
   getPendingVoids,
-  acceptVoid,
-  rejectVoid,
-  insertPendingVoid,
+  resolvePendingVoid,
+  rejectPendingVoid,
 } from './repository';
 import { withTransaction } from '../../shared/db';
 import { domainEventBus } from '../../shared/domain_events';
 
-/**
- * Core entry point used by both REST controllers and the MQTT worker.
- * Returns a SubmissionResult for each processed event.
- */
 export async function processEvent(raw: any): Promise<SubmissionResult> {
   const now = new Date().toISOString();
 
+  // 1. Structural validation
   const validation = validateEvent(raw);
   if (!validation.ok) {
-    // rejected payload – still log the attempt
     await withTransaction(async (client) => {
       await insertSubmissionAttempt(
         client,
-        raw.source_id ?? null,
-        raw.event_id ?? null,
+        typeof raw?.source_id === 'string' ? raw.source_id : null,
+        typeof raw?.event_id === 'string' ? raw.event_id : null,
         raw,
         'REJECTED',
         validation.reason
       );
     });
     return {
-      event_id: raw.event_id ?? 'unknown',
+      event_id: typeof raw?.event_id === 'string' ? raw.event_id : 'unknown',
       status: 'REJECTED',
       reason: validation.reason,
       received_at: now,
@@ -46,35 +41,38 @@ export async function processEvent(raw: any): Promise<SubmissionResult> {
   }
 
   const payload = validation.value;
-
-  // Transaction ensures atomic processing & logging
-  const domainEvents: Array<{ type: string; payload: any }> = [];
+  const domainEventsToEmit: Array<{ type: 'EVENT_ACCEPTED' | 'VOID_RESOLVED'; payload: any }> = [];
 
   const result = await withTransaction(async (client: PoolClient) => {
-    // Classification against existing records (duplicate / conflict)
-    const { rows } = await client.query(
-      `SELECT * FROM production_events WHERE event_id = $1`,
-      [payload.event_id]
-    );
-    if (rows.length > 0) {
-      const existing = rows[0];
-      const existingNorm = {
+    // Check if event_id already exists (duplicate or conflict)
+    const existing = await findEventById(client, payload.event_id, true);
+    if (existing) {
+      const existingNormalized = {
         source_id: existing.source_id.trim(),
         event_id: existing.event_id.trim(),
-        type: existing.type as ProductionEventPayload['type'],
-        quantity: existing.quantity,
-        target_event_id: existing.target_event_id?.trim() ?? null,
+        type: existing.type,
+        quantity: existing.quantity != null ? Number(existing.quantity) : null,
+        target_event_id: existing.target_event_id ? existing.target_event_id.trim() : null,
         event_time: new Date(existing.event_time).toISOString(),
-      } as ProductionEventPayload;
+      };
 
-      const isEqual =
-        existingNorm.source_id === payload.source_id &&
-        existingNorm.type === payload.type &&
-        existingNorm.quantity === payload.quantity &&
-        existingNorm.target_event_id === payload.target_event_id &&
-        existingNorm.event_time === payload.event_time;
+      const currentNormalized = {
+        source_id: payload.source_id.trim(),
+        event_id: payload.event_id.trim(),
+        type: payload.type,
+        quantity: payload.quantity != null ? Number(payload.quantity) : null,
+        target_event_id: payload.target_event_id ? payload.target_event_id.trim() : null,
+        event_time: new Date(payload.event_time).toISOString(),
+      };
 
-      if (isEqual) {
+      const isDuplicate =
+        existingNormalized.source_id === currentNormalized.source_id &&
+        existingNormalized.type === currentNormalized.type &&
+        existingNormalized.quantity === currentNormalized.quantity &&
+        existingNormalized.target_event_id === currentNormalized.target_event_id &&
+        existingNormalized.event_time === currentNormalized.event_time;
+
+      if (isDuplicate) {
         await insertSubmissionAttempt(
           client,
           payload.source_id,
@@ -94,35 +92,68 @@ export async function processEvent(raw: any): Promise<SubmissionResult> {
           payload.event_id,
           raw,
           'CONFLICT',
-          'Payload differs from existing event'
+          'Payload differs from existing event record'
         );
         return {
           event_id: payload.event_id,
           status: 'CONFLICT' as EventStatus,
-          reason: 'Different payload for same event_id',
+          reason: 'Payload differs from existing event record',
           received_at: now,
         };
       }
     }
 
-    // New event – process according to type
+    // Process new event
     if (payload.type === 'COUNT') {
-      const inserted = await processCount(client, payload);
-      // After a COUNT is stored we may need to resolve pending VOIDs
-      const pending = await getPendingVoids(client, payload.event_id);
-      if (pending.length > 0) {
-        // Accept the first pending VOID, reject the rest
-        const [first, ...rest] = pending;
-        const countRow = await findEventById(client, payload.event_id, true);
-        await acceptVoid(client, first, countRow);
-        domainEvents.push({ type: 'EVENT_ACCEPTED', payload: { event_id: payload.event_id, source_id: payload.source_id, type: 'COUNT', quantity: payload.quantity } });
-        domainEvents.push({ type: 'VOID_RESOLVED', payload: { void_event_id: first.event_id, target_event_id: payload.event_id, source_id: payload.source_id } });
-        for (const other of rest) {
-          await rejectVoid(client, other, 'Another VOID already resolved this COUNT');
+      // 1. Insert COUNT
+      const countRow = await insertEvent(client, payload, 'ACCEPTED');
+
+      domainEventsToEmit.push({
+        type: 'EVENT_ACCEPTED',
+        payload: {
+          event_id: payload.event_id,
+          source_id: payload.source_id,
+          type: 'COUNT',
+          quantity: payload.quantity ?? null,
+        },
+      });
+
+      // 2. Check for pending VOIDs targeting this COUNT
+      const pendingVoids = await getPendingVoids(client, payload.event_id);
+      if (pendingVoids.length > 0) {
+        let winningVoid: any = null;
+
+        for (const pv of pendingVoids) {
+          if (!winningVoid && pv.source_id === payload.source_id) {
+            // First valid VOID wins
+            winningVoid = pv;
+            await resolvePendingVoid(client, pv.id, pv.event_id, countRow.id);
+
+            domainEventsToEmit.push({
+              type: 'VOID_RESOLVED',
+              payload: {
+                void_event_id: pv.event_id,
+                target_event_id: payload.event_id,
+                source_id: payload.source_id,
+              },
+            });
+          } else {
+            // Subsequent pending VOIDs or mismatched source_id are rejected
+            await rejectPendingVoid(client, pv.id);
+            await insertSubmissionAttempt(
+              client,
+              pv.source_id,
+              pv.event_id,
+              { event_id: pv.event_id, target_event_id: payload.event_id },
+              'REJECTED',
+              pv.source_id !== payload.source_id
+                ? 'source_id mismatch with target COUNT'
+                : 'COUNT already reversed by an earlier pending VOID'
+            );
+          }
         }
-      } else {
-        domainEvents.push({ type: 'EVENT_ACCEPTED', payload: { event_id: payload.event_id, source_id: payload.source_id, type: 'COUNT', quantity: payload.quantity } });
       }
+
       await insertSubmissionAttempt(
         client,
         payload.source_id,
@@ -130,108 +161,147 @@ export async function processEvent(raw: any): Promise<SubmissionResult> {
         raw,
         'ACCEPTED'
       );
-      return { event_id: payload.event_id, status: 'ACCEPTED' as EventStatus, received_at: now };
+
+      return {
+        event_id: payload.event_id,
+        status: 'ACCEPTED' as EventStatus,
+        received_at: now,
+      };
     } else {
-      // VOID handling
-      const voidResult = await processVoid(client, payload);
-      // processVoid already logs submission attempt and pushes domain events
-      return voidResult;
+      // VOID event processing
+      const target = await findEventById(client, payload.target_event_id!, true);
+
+      if (!target) {
+        // Target COUNT missing -> store as PENDING_REFERENCE
+        await insertEvent(client, payload, 'PENDING_REFERENCE');
+        await insertSubmissionAttempt(
+          client,
+          payload.source_id,
+          payload.event_id,
+          raw,
+          'PENDING_REFERENCE'
+        );
+        return {
+          event_id: payload.event_id,
+          status: 'PENDING_REFERENCE' as EventStatus,
+          reason: 'Target event not found, saved as pending reference',
+          received_at: now,
+        };
+      }
+
+      // Target exists: validate rules
+      if (target.type !== 'COUNT') {
+        await insertSubmissionAttempt(
+          client,
+          payload.source_id,
+          payload.event_id,
+          raw,
+          'REJECTED',
+          'Target event is not a COUNT'
+        );
+        return {
+          event_id: payload.event_id,
+          status: 'REJECTED' as EventStatus,
+          reason: 'Target event is not a COUNT',
+          received_at: now,
+        };
+      }
+
+      if (target.source_id !== payload.source_id) {
+        await insertSubmissionAttempt(
+          client,
+          payload.source_id,
+          payload.event_id,
+          raw,
+          'REJECTED',
+          'source_id does not match target COUNT source_id'
+        );
+        return {
+          event_id: payload.event_id,
+          status: 'REJECTED' as EventStatus,
+          reason: 'source_id does not match target COUNT source_id',
+          received_at: now,
+        };
+      }
+
+      if (target.void_event_id) {
+        await insertSubmissionAttempt(
+          client,
+          payload.source_id,
+          payload.event_id,
+          raw,
+          'REJECTED',
+          'Target COUNT has already been reversed'
+        );
+        return {
+          event_id: payload.event_id,
+          status: 'REJECTED' as EventStatus,
+          reason: 'Target COUNT has already been reversed',
+          received_at: now,
+        };
+      }
+
+      // Valid VOID -> insert as ACCEPTED and auto-acknowledge
+      const voidRow = await insertEvent(
+        client,
+        payload,
+        'ACCEPTED',
+        null,
+        new Date()
+      );
+
+      // Link COUNT to this VOID
+      await client.query(
+        `UPDATE production_events SET void_event_id = $1 WHERE id = $2`,
+        [voidRow.event_id, target.id]
+      );
+
+      await insertSubmissionAttempt(
+        client,
+        payload.source_id,
+        payload.event_id,
+        raw,
+        'ACCEPTED'
+      );
+
+      domainEventsToEmit.push({
+        type: 'EVENT_ACCEPTED',
+        payload: {
+          event_id: payload.event_id,
+          source_id: payload.source_id,
+          type: 'VOID',
+          quantity: null,
+        },
+      });
+
+      domainEventsToEmit.push({
+        type: 'VOID_RESOLVED',
+        payload: {
+          void_event_id: payload.event_id,
+          target_event_id: payload.target_event_id!,
+          source_id: payload.source_id,
+        },
+      });
+
+      return {
+        event_id: payload.event_id,
+        status: 'ACCEPTED' as EventStatus,
+        received_at: now,
+      };
     }
   });
 
-  // Emit any domain events after the transaction has committed
-  for (const ev of domainEvents) {
-    // @ts-ignore – generic typing
-    domainEventBus.emitEvent(ev.type as any, ev.payload);
+  // Emit domain events strictly post-commit
+  for (const de of domainEventsToEmit) {
+    domainEventBus.emitEvent(de.type, de.payload);
   }
 
-  return result as SubmissionResult;
+  return result;
 }
 
-/** Process a COUNT event – simply insert with ACCEPTED status */
-async function processCount(client: PoolClient, payload: ProductionEventPayload) {
-  await insertEvent(client, payload, 'ACCEPTED');
-  return payload;
-}
-
-/** Process a VOID event – may become PENDING_REFERENCE or ACCEPTED */
-async function processVoid(client: PoolClient, payload: ProductionEventPayload) {
-  // Lock target COUNT row if it exists
-  const target = await findEventById(client, payload.target_event_id!, true);
-  if (!target) {
-    // No target yet – store as pending reference
-    await insertPendingVoid(client, payload, 'PENDING_REFERENCE');
-    await insertSubmissionAttempt(
-      client,
-      payload.source_id,
-      payload.event_id,
-      payload,
-      'ACCEPTED'
-    );
-    // No domain events yet; will be emitted when the COUNT arrives
-    return { event_id: payload.event_id, status: 'PENDING_REFERENCE' as EventStatus, received_at: new Date().toISOString() };
-  }
-
-  // Target exists – enforce business rules
-  if (target.type !== 'COUNT') {
-    await insertSubmissionAttempt(
-      client,
-      payload.source_id,
-      payload.event_id,
-      payload,
-      'REJECTED',
-      'Target event is not a COUNT'
-    );
-    return { event_id: payload.event_id, status: 'REJECTED' as EventStatus, reason: 'Target not COUNT', received_at: new Date().toISOString() };
-  }
-
-  if (target.source_id !== payload.source_id) {
-    await insertSubmissionAttempt(
-      client,
-      payload.source_id,
-      payload.event_id,
-      payload,
-      'REJECTED',
-      'source_id mismatch with target COUNT'
-    );
-    return { event_id: payload.event_id, status: 'REJECTED' as EventStatus, reason: 'source_id mismatch', received_at: new Date().toISOString() };
-  }
-
-  if (target.void_event_id) {
-    // COUNT already voided
-    await insertSubmissionAttempt(
-      client,
-      payload.source_id,
-      payload.event_id,
-      payload,
-      'REJECTED',
-      'COUNT already voided by another VOID'
-    );
-    return { event_id: payload.event_id, status: 'REJECTED' as EventStatus, reason: 'COUNT already voided', received_at: new Date().toISOString() };
-  }
-
-  // Accept the VOID and update the COUNT
-  await acceptVoid(client, payload, target);
-  await insertSubmissionAttempt(
-    client,
-    payload.source_id,
-    payload.event_id,
-    payload,
-    'ACCEPTED'
-  );
-  // Queue domain events
-  (global as any).domainEvents?.push({ type: 'EVENT_ACCEPTED', payload: { event_id: payload.event_id, source_id: payload.source_id, type: 'VOID', quantity: null } });
-  (global as any).domainEvents?.push({ type: 'VOID_RESOLVED', payload: { void_event_id: payload.event_id, target_event_id: payload.target_event_id, source_id: payload.source_id } });
-  return { event_id: payload.event_id, status: 'ACCEPTED' as EventStatus, received_at: new Date().toISOString() };
-}
-
-/**
- * Process a batch of raw event objects while preserving order.
- */
 export async function processBatch(items: any[]): Promise<SubmissionResult[]> {
   const results: SubmissionResult[] = [];
   for (const item of items) {
-    // Sequential processing guarantees order preservation
     const res = await processEvent(item);
     results.push(res);
   }
