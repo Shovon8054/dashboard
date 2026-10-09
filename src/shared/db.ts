@@ -13,6 +13,11 @@ export const pool = new Pool({
   ssl: isRemote ? { rejectUnauthorized: false } : undefined,
 });
 
+// Prevent process crash on idle-connection resets (Supabase pooler drops TLS connections)
+pool.on('error', (err) => {
+  console.warn('pg pool idle client error (non-fatal):', err.message);
+});
+
 export async function withTransaction<T>(
   callback: (client: PoolClient) => Promise<T>
 ): Promise<T> {
